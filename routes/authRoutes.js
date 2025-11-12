@@ -1,8 +1,12 @@
 import express from "express";
-import { registerAdmin, loginAdmin } from "../controllers/authController.js";
+import { loginCommon, registerAdmin } from "../controllers/authController.js";
 
 const router = express.Router();
-router.post("/register", registerAdmin);
-router.post("/login", loginAdmin);
+
+// 🧩 Common login for Admin + Coordinator
+router.post("/login", loginCommon);
+
+// 🏢 One-time Admin registration (for setup via Postman)
+router.post("/register-admin", registerAdmin);
 
 export default router;

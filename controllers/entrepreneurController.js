@@ -466,17 +466,51 @@
 // };
 import Entrepreneur from "../models/Entrepreneur.js";
 import { sendMail } from "../utils/sendMail.js";
+import axios from "axios";
 
-/* ---------------- Helper Functions ---------------- */
+/* ==========================================================
+   📞 MSISDN Normalizer (India)
+   - Returns "91" + 10 digits or null if invalid
+========================================================== */
+function normalizeMsisdn(raw = "") {
+  if (!raw) return null;
 
-// Extract client IP (supports proxies)
+  // 1) strip everything non-digit
+  let n = String(raw).replace(/[^\d]/g, "");
+
+  // 2) handle common prefixes
+  //    0091XXXXXXXXXX, 091XXXXXXXXXX, 0XXXXXXXXXX, 91XXXXXXXXXX, XXXXXXXXXX
+  if (n.startsWith("00")) n = n.slice(2);           // 0091...
+  if (n.startsWith("0") && !n.startsWith("09")) {
+    // single leading 0 for local landline pattern like 0XXXXXXXXXX
+    n = n.slice(1);
+  }
+  if (n.startsWith("091")) n = n.slice(1);          // 091XXXXXXXXXX -> 91XXXXXXXXXX
+
+  // 3) if it already starts with 91 and has extra digits (like 9191XXXXXXXXXX),
+  //    keep last 12 (91 + 10 digits).
+  if (n.startsWith("91") && n.length > 12) {
+    n = n.slice(n.length - 12);
+  }
+
+  // 4) Turn 10-digit into 91 + 10
+  if (/^\d{10}$/.test(n)) n = `91${n}`;
+
+  // 5) Validate final
+  if (/^91\d{10}$/.test(n)) return n;
+
+  return null;
+}
+
+/* ==========================================================
+   🌐 IP + GEO helpers
+========================================================== */
 function getClientIp(req) {
   const xf = req.headers["x-forwarded-for"];
   if (xf) return xf.split(",")[0].trim();
-  return req.socket.remoteAddress || "";
+  return req.socket?.remoteAddress || "";
 }
 
-// Detect local/private IPs
 function isLocal(ip = "") {
   const v4 = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
   return (
@@ -489,30 +523,75 @@ function isLocal(ip = "") {
   );
 }
 
-// Fetch location data from public API
 async function geoFromApi(ip) {
   try {
     if (!ip) return null;
     const res = await fetch(`https://ipapi.co/${ip}/json/`);
-    const data = await res.json();
-    if (data && !data.error) {
+    const d = await res.json();
+    if (!d?.error) {
       return {
         ip,
-        country: data.country_name || "Unknown",
-        region: data.region || "Unknown",
-        city: data.city || "Unknown",
-        latitude: data.latitude || null,
-        longitude: data.longitude || null,
+        country: d.country_name || "Unknown",
+        state: d.region || "Unknown",
+        district: d.city || "Unknown",
+        coordinates:
+          d.latitude && d.longitude ? [d.latitude, d.longitude] : [],
       };
     }
-  } catch (err) {
-    console.error("🌍 geoFromApi error:", err.message);
+  } catch (e) {
+    console.error("🌍 geoFromApi error:", e.message);
   }
   return null;
 }
 
-/* ---------------- Controller ---------------- */
+/* ==========================================================
+   💬 SmartPing v2 sender
+   - Expects destination as 91XXXXXXXXXX (no +)
+========================================================== */
+async function sendWhatsAppMessage({ fullName, district, state, msisdn }) {
+  const API_URL =
+    process.env.SMARTPING_API_URL ||
+    "https://backend.api-wa.co/campaign/smartping/api/v2";
+  const API_KEY = process.env.SMARTPING_API_TOKEN; // put your long token in .env
 
+  if (!API_KEY) {
+    console.warn("⚠️ SMARTPING_API_TOKEN missing — skipping WhatsApp send.");
+    return null;
+  }
+
+  const payload = {
+    apiKey: API_KEY,
+    // 👇 must exactly match your approved campaign name in SmartPing
+    campaignName: "solar_training",
+    destination: msisdn, // already normalized to 91XXXXXXXXXX
+    userName: "BRIHASPATHI TECHNOLOGIES PRIVATE LIMITED",
+    // map to {{1}}, {{2}}, {{3}} in your template
+    templateParams: [fullName || "User", district || "Unknown", state || "Unknown"],
+    source: "brihaspathi-website",
+    media: {},
+    buttons: [],
+    carouselCards: [],
+    location: {},
+    attributes: {},
+    paramsFallbackValue: { FirstName: "user" },
+  };
+
+  try {
+    const { data } = await axios.post(API_URL, payload, {
+      headers: { "Content-Type": "application/json" },
+      timeout: 15000,
+    });
+    console.log("✅ SmartPing v2:", data);
+    return data;
+  } catch (err) {
+    console.error("❌ SmartPing v2 error:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+/* ==========================================================
+   🚀 POST /api/entrepreneur/register
+========================================================== */
 export const registerEntrepreneur = async (req, res) => {
   try {
     const {
@@ -527,129 +606,123 @@ export const registerEntrepreneur = async (req, res) => {
       theme,
     } = req.body;
 
-    // ---------- Validate ----------
-    if (!fullname || !email || !mobile)
+    // required fields
+    if (!fullname || !email || !mobile) {
       return res
         .status(400)
         .json({ message: "Fullname, email, and mobile are required." });
+    }
 
-    // ---------- Check duplicate ----------
+    // duplicate check
     const exists = await Entrepreneur.findOne({ email });
-    if (exists)
+    if (exists) {
       return res.status(400).json({ message: "Email already registered." });
+    }
 
-    // ---------- Detect IP ----------
+    // normalize mobile → msisdn
+    const msisdn = normalizeMsisdn(mobile);
+    if (!msisdn) {
+      return res.status(400).json({
+        message:
+          "Invalid mobile number. Enter a 10-digit Indian number or formats like +91xxxxxxxxxx / 0091xxxxxxxxxx.",
+      });
+    }
+
+    // IP + Geo
     let ip = getClientIp(req);
-    if (isLocal(ip)) ip = testIp || ""; // allow testing manually
-
-    // ---------- Fetch location ----------
+    if (isLocal(ip)) ip = testIp || "";
     const geo = ip ? await geoFromApi(ip) : null;
 
-    // ---------- Save new record ----------
-    const newUser = await Entrepreneur.create({
+    // store record
+    const doc = await Entrepreneur.create({
       fullname,
       email,
-      mobile,
+      mobile, // keep original user input
       formState: state || "",
       formDistrict: district || "",
       formCity: city || "",
       pincode: pincode || "",
-      detectedLocation: {
-        ip: geo?.ip || "local",
-        country: geo?.country || "Unknown",
-        state: geo?.region || "Unknown",
-        district: geo?.city || "Unknown",
-        coordinates:
-          geo?.latitude && geo?.longitude
-            ? [geo.latitude, geo.longitude]
-            : [],
-      },
+      detectedLocation:
+        geo || {
+          ip: "local",
+          country: "Unknown",
+          state: "Unknown",
+          district: "Unknown",
+          coordinates: [],
+        },
       status: "Pending",
     });
 
-    // ---------- Prepare Email ----------
+    // email
     const isDark = theme === "dark";
     const logoURL = isDark
       ? "https://www.brihaspathi.com/highbtlogo%20white-%20tm.png"
       : "https://www.brihaspathi.com/highbtlogo%20tm%20(1).png";
 
     const html = `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <meta name="color-scheme" content="light dark">
-        <meta name="supported-color-schemes" content="light dark">
-        <style>
-          body {
-            margin: 0;
-            padding: 0;
-            font-family: Arial, Helvetica, sans-serif;
-            background: #ffffff;
-            color: #07518a;
-            text-align: center;
-          }
-          @media (prefers-color-scheme: dark) {
-            body { background: #111111 !important; color: #ffffff !important; }
-          }
-          a { color: #07518a; text-decoration: none; }
-        </style>
-      </head>
-      <body>
-        <div style="max-width:600px;margin:auto;padding:30px 20px;">
-          <img src="${logoURL}" alt="BTPL" style="max-width:180px;margin-bottom:20px;">
-          <h2>Thank You for Registering!</h2>
-          <p style="font-size:16px;line-height:1.6;">
-            Dear <strong>${fullname}</strong>,<br>
-            We have successfully received your registration.<br>
-            Your current detected location:
-          </p>
-          <div style="font-size:15px;color:#333;margin-top:10px;">
-            📍 <b>${geo?.city || "Unknown"}</b>, ${geo?.region || "Unknown"}, ${geo?.country || "Unknown"}
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta name="color-scheme" content="light dark">
+          <meta name="supported-color-schemes" content="light dark">
+          <style>
+            body { margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#ffffff;color:#07518a;text-align:center; }
+            @media (prefers-color-scheme: dark) {
+              body { background:#111111 !important; color:#ffffff !important; }
+            }
+            a { color:#07518a; text-decoration:none; }
+          </style>
+        </head>
+        <body>
+          <div style="max-width:600px;margin:auto;padding:30px 20px;">
+            <img src="${logoURL}" alt="BTPL" style="max-width:180px;margin-bottom:20px;">
+            <h2>Thank You for Registering!</h2>
+            <p style="font-size:16px;line-height:1.6;">
+              Dear <strong>${fullname}</strong>,<br/>
+              We have successfully received your registration.
+            </p>
+            <div style="font-size:15px;color:#333;margin-top:10px;">
+              📍 <b>${geo?.district || "Unknown"}</b>, ${geo?.state || "Unknown"}, ${geo?.country || "Unknown"}
+            </div>
+            <div style="margin:25px 0;">
+              <a href="https://chat.whatsapp.com/DOHjxHWQBjfEHmi8N8iAT4"
+                 style="display:inline-block;margin:6px;padding:12px 20px;background:#fff;border:2px solid #07518a;border-radius:6px;font-weight:bold;color:#07518a;">
+                Join WhatsApp Community
+              </a>
+              <a href="https://www.brihaspathi.com"
+                 style="display:inline-block;margin:6px;padding:12px 20px;background:#07518a;border:2px solid #07518a;border-radius:6px;font-weight:bold;color:#ffffff;">
+                🌐 Visit Our Website
+              </a>
+            </div>
+            <p style="font-size:12px;color:#888;margin-top:25px;">
+              © 2025 <b>BTPL</b>. All rights reserved.
+            </p>
           </div>
+        </body>
+      </html>`;
 
-          <div style="margin:25px 0;">
-            <a href="https://chat.whatsapp.com/DOHjxHWQBjfEHmi8N8iAT4"
-               style="display:inline-block;margin:6px;padding:12px 20px;background:#fff;
-                      border:2px solid #07518a;border-radius:6px;
-                      font-weight:bold;color:#07518a;">
-              <img src="https://upload.wikimedia.org/wikipedia/commons/6/6b/WhatsApp.svg"
-                   width="20" height="20" style="vertical-align:middle;margin-right:8px;">
-              Join WhatsApp Community
-            </a>
-            <a href="https://www.brihaspathi.com"
-               style="display:inline-block;margin:6px;padding:12px 20px;background:#07518a;
-                      border:2px solid #07518a;border-radius:6px;
-                      font-weight:bold;color:#ffffff;">
-              🌐 Visit Our Website
-            </a>
-          </div>
-
-          <p style="font-size:14px;">
-            Or copy this link:
-            <a href="https://www.brihaspathi.com">www.brihaspathi.com</a>
-          </p>
-
-          <p style="font-size:12px;color:#888;margin-top:25px;">
-            © 2025 <b>BTPL</b> (Brihaspathi Technologies Ltd). All rights reserved.
-          </p>
-        </div>
-      </body>
-    </html>`;
-
-    // ---------- Send Email ----------
     await sendMail(
       email,
       "Welcome to BTPL Solar Entrepreneurship Program",
       html
     );
 
-    // ---------- Respond ----------
-    res.status(201).json({
-      message: "Registration successful. Location detected and email sent.",
-      data: newUser,
+    // WhatsApp (uses normalized msisdn)
+    await sendWhatsAppMessage({
+      fullName: fullname,
+      district,
+      state,
+      msisdn, // 91XXXXXXXXXX
+    });
+
+    return res.status(201).json({
+      message: "Registration successful. Email and WhatsApp message sent.",
+      data: doc,
     });
   } catch (err) {
     console.error("❌ Registration Error:", err);
-    res.status(500).json({ message: "Server error", error: err.message });
+    return res
+      .status(500)
+      .json({ message: "Server error", error: err.message });
   }
 };
